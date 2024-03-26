@@ -30,6 +30,8 @@ namespace AlinityService
         // порт, используемый прибором для получения сообщений от ЛИС. Драйвер должен подключаться к анализатору по порту 50020 клиентом
         public static int receiving_port = 50020;
         public static string analyzerIPadress = "10.128.143.200"; // ip адрес роутера, WAN
+        // сокет для отправки в канал получения данных от драйвера
+        Socket sending_socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
 
         public static string user = "PSMExchangeUser"; // логин для базы обмена файлами и для базы CGM Analytix
         public static string password = "PSM_123456";  // пароль для базы обмена файлами и для базы CGM Analytix
@@ -551,6 +553,7 @@ namespace AlinityService
             // строка c заданием в массив байт
             byte[] SendingMessageBytes;
             SendingMessageBytes = ConcatByteArray(VT, utf8.GetBytes(omlResponse), CR, FS, CR);
+            
             // отправляем прибору
             if (client_.Poll(1, SelectMode.SelectWrite))
             {
@@ -559,6 +562,16 @@ namespace AlinityService
                 ExchangeLog("LIS (driver as CLI):" + "\n" + utf8.GetString(SendingMessageBytes));
                 ExchangeLog($"");
             }
+
+            // Если состояние сокета клиента connected: false, то поидее нужно создать новый сокет
+            
+            /*
+            ExchangeLog("Пробуем отправить без условия client_.Poll(1, SelectMode.SelectWrite)");
+            client_.Send(SendingMessageBytes);
+            ExchangeLog($"Sending Order Request OML^O33 to analyzer");
+            ExchangeLog("LIS (driver as CLI):" + "\n" + utf8.GetString(SendingMessageBytes));
+            ExchangeLog($"");
+            */
 
         }
         #endregion
@@ -829,6 +842,9 @@ namespace AlinityService
                     #region папки архива, результатов и ошибок
 
                     string OutFolder = ConfigurationManager.AppSettings["FolderOut"];
+
+                    //string OutFolder = AnalyzerResultPath + @"\CGM";
+
                     // архивная папка
                     string ArchivePath = AnalyzerResultPath + @"\Archive";
                     // папка для ошибок
@@ -863,8 +879,8 @@ namespace AlinityService
 
                     // шаблоны регулярных выражений для поиска данных
                     string RIDPattern = @"SAC[|][|][|](?<RID>\d+)[|]\S*";
-                    string TestPattern = @"OBX[|]\d+[|]ST[|](?<Test>.+)[@]99ABT[|]1";
-                    string ResultPattern = @"OBX[|]\d+[|]ST[|].*[|]1[|](?<Result>[<>]?\s?\S+)[|]\S+UCUM";
+                    string TestPattern = @"OBX[|]\d+[|]ST[|](?<Test>.+)[@]99ABT[|][0-9]";
+                    string ResultPattern = @"OBX[|]\d+[|]ST[|].*[|][0-9][|](?<Result>[<>]?\s?\S+)[|]\S+UCUM";
 
                     Regex RIDRegex = new Regex(RIDPattern, RegexOptions.None, TimeSpan.FromMilliseconds(150));
                     Regex TestRegex = new Regex(TestPattern, RegexOptions.None, TimeSpan.FromMilliseconds(150));
@@ -877,6 +893,11 @@ namespace AlinityService
                         string[] lines = System.IO.File.ReadAllLines(file);
                         string RID = "";
                         string Test = "";
+                        //string Result = "";
+
+                        // обнулим переменные
+                        MessageHead = "";
+                        MessageTest = "";
 
                         // обрезаем только имя текущего файла
                         string FileName = file.Substring(AnalyzerResultPath.Length + 1);
@@ -912,6 +933,7 @@ namespace AlinityService
                                 Test = Test.Replace("@", "^");
                                 string PSMTestCode = TranslateToPSMCodes(Test);
                                 string Result = "";
+
                                 if (ResultMatch.Success)
                                 {
                                     Result = ResultMatch.Result("${Result}");
@@ -932,6 +954,8 @@ namespace AlinityService
                                 {
                                     // формируем строку с ответом для результирующего файла
                                     MessageTest = MessageTest + $"R|1|^^^{PSMTestCode}^^^^{AnalyzerCode}|{Result}|||N||F||ALINITY^||20230101000001|{AnalyzerCode}" + "\r";
+
+
                                 }
                             }
                         }
@@ -1043,15 +1067,123 @@ namespace AlinityService
         }
         #endregion
 
+        // Поток TCP клиента драйвера для передачи данных прибору
+        #region TCP клиент драйвера
+        public void TCPClient()
+        {
+            ServiceLog("TCP клиент драйвера запущен.");
+            IPAddress tcpClient_ip = IPAddress.Parse(analyzerIPadress);
+            // конечная точка - объединение IP-адреса прибора и порта 50020
+            IPEndPoint receiving_endpoint = new IPEndPoint(tcpClient_ip, receiving_port);
+
+            int clientcount = 0; // счетчик
+
+            try
+            {
+                // пытаемся подключиться
+                sending_socket.Connect(receiving_endpoint);
+                ServiceLog("Подключение к серверу анализатора установлено.");
+                ServiceLog($"Адрес сервера анализатора: {sending_socket.RemoteEndPoint}");
+                ServiceLog($"Адрес клиента драйвера: {sending_socket.LocalEndPoint}");
+            }
+            catch(Exception ex)
+            {
+                ServiceLog(ex.ToString());
+            }
+
+            while (ServiceIsActive)
+            {
+                // Если состояние сокета клиента connected: false, то поидее нужно создать новый сокет
+                if (sending_socket.Available == 0 && !sending_socket.Connected)
+                {
+                    ServiceLog("Подключение TCP-клиента драйвера к хосту неактивно.");
+                    ServiceLog("Свойства сокета TCP-клиента: " +
+                               $"Blocking: {sending_socket.Blocking}; " +
+                               $"Connected: {sending_socket.Connected}; " +
+                               $"RemoteEndPoint: {sending_socket.RemoteEndPoint}; " +
+                               $"LocalEndPoint: {sending_socket.LocalEndPoint}; ");
+                    ServiceLog("Состояние сокета TCP-клиента: " +
+                               $"handler.Available {sending_socket.Available}; " +
+                               $"SelectRead: {sending_socket.Poll(1, SelectMode.SelectRead)}; " +
+                               $"SelectWrite: {sending_socket.Poll(1, SelectMode.SelectWrite)}; " +
+                               $"SelectError: {sending_socket.Poll(1, SelectMode.SelectError)};");
+
+                    ServiceLog("Shutdown. Close.");
+                    sending_socket.Shutdown(SocketShutdown.Both);
+                    sending_socket.Close();
+                    // пытаемся подключиться
+                    ServiceLog("Подключение к серверу анализатора");
+                    sending_socket.Connect(receiving_endpoint);
+
+                }
+
+                // если клиент драйвера ничего не получает от сервера анализатора
+                if(sending_socket.Available == 0)
+                {
+                    clientcount++;
+                    if (clientcount == 100)
+                    {
+                        clientcount = 0;
+                        ServiceLog("TCP-клиент драйвера подключен к хосту.");
+                        ServiceLog("Свойства сокета TCP-клиента: " +
+                                   $"Blocking: {sending_socket.Blocking}; " +
+                                   $"Connected: {sending_socket.Connected}; " +
+                                   $"RemoteEndPoint: {sending_socket.RemoteEndPoint}; " +
+                                   $"LocalEndPoint: {sending_socket.LocalEndPoint}; ");
+                        ServiceLog("Состояние сокета TCP-клиента: " +
+                                   $"handler.Available {sending_socket.Available}; " +
+                                   $"SelectRead: {sending_socket.Poll(1, SelectMode.SelectRead)}; " +
+                                   $"SelectWrite: {sending_socket.Poll(1, SelectMode.SelectWrite)}; " +
+                                   $"SelectError: {sending_socket.Poll(1, SelectMode.SelectError)};");
+                    }
+                }
+                // если сервер прибора что-то отправил клиенту драйвера
+                // отьправить он может подтверждение получения ACK
+
+                // считывать данные клиентом логично тоже в этом потоке
+
+                else
+                {
+                    ServiceLog("Есть данные на сокете. Получение данных от хоста прибора.");
+                    ServiceLog("Свойства сокета TCP-клиента: " +
+                               $"Blocking: {sending_socket.Blocking}; " +
+                               $"Connected: {sending_socket.Connected}; " +
+                               $"RemoteEndPoint: {sending_socket.RemoteEndPoint}; " +
+                               $"LocalEndPoint: {sending_socket.LocalEndPoint}; ");
+                    ServiceLog("Состояние сокета TCP-клиента:: " +
+                               $"handler.Available {sending_socket.Available}; " +
+                               $"SelectRead: {sending_socket.Poll(1, SelectMode.SelectRead)}; " +
+                               $"SelectWrite: {sending_socket.Poll(1, SelectMode.SelectWrite)}; " +
+                               $"SelectError: {sending_socket.Poll(1, SelectMode.SelectError)};");
+
+                    ExchangeLog("Receiving ACK from analyzer SRV");
+                    // буфер для получения данных
+                    var responseBytes = new byte[512];
+                    // получаем данные
+                    var bytes = sending_socket.Receive(responseBytes);
+                    // преобразуем полученные данные в строку
+                    string response = Encoding.UTF8.GetString(responseBytes, 0, bytes);
+                    // выводим данные на консоль
+                    ExchangeLog("Analyzer (driver as CLI):" + "\n" + response);
+
+                }
+
+                Thread.Sleep(1000);
+            }
+        }
+        #endregion
+
         #region TCP сервер драйвера (HL7)
-        static void TCPServer()
+        //static void TCPServer()
+        public void TCPServer()
         {
             try
             {
                 while (ServiceIsActive)
                 {
-                    #region Настраиваем TCP клиент для передачи данных на прибор
 
+                    #region Настраиваем TCP клиент для передачи данных на прибор
+                    /*
                     ServiceLog("TCP клиент драйвера запущен.");
                     IPAddress tcpClient_ip = IPAddress.Parse(analyzerIPadress);
                     // конечная точка - объединение IP-адреса прибора и порта 50020
@@ -1069,9 +1201,10 @@ namespace AlinityService
                     }
                     catch (Exception ex)
                     {
+                        ServiceLog("Exception!!!");
                         ServiceLog(ex.ToString());
                     }
-
+                    */
                     #endregion
 
                     IPAddress ip = IPAddress.Parse(IPadress);
@@ -1079,21 +1212,23 @@ namespace AlinityService
                     EndPoint endpoint = new IPEndPoint(ip, port);
                     // создаем сокет
                     Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                    ServiceLog("Создали сокет TCP сервера");
                     // связываем сокет с локальной точкой endpoint 
                     socket.Bind(endpoint);
+                    ServiceLog("Связали сокет с конечной точкой");
 
                     // получаем конечную точку, с которой связан сокет
-                    ServiceLog(socket.LocalEndPoint.ToString());
+                    //ServiceLog(socket.LocalEndPoint.ToString());
 
                     // запуск прослушивания подключений
                     socket.Listen(1000);
-                    ServiceLog("TCP Сервер запущен. Ожидание подключений...");
+                    ServiceLog($"{socket.LocalEndPoint}. TCP Сервер запущен. Ожидание подключений...");
                     // После начала прослушивания сокет готов принимать подключения
                     // получаем входящее подключение
                     Socket client = socket.Accept();
 
                     // получаем адрес клиента, который подключился к нашему tcp серверу
-                    ServiceLog($"Адрес подключенного клиента: {client.RemoteEndPoint}");
+                    ServiceLog($"Адрес подключенного к серверу драйвера клиента: {client.RemoteEndPoint}");
 
                     int ServerCount = 0; // счетчик
 
@@ -1101,11 +1236,25 @@ namespace AlinityService
                     {
                         // нет данных для чтения и соединение не активно
                         // прибор клиентом подключается, когда есть, что передать, затем отключается
+
                         if (client.Poll(1, SelectMode.SelectRead) && client.Available == 0)
                         {
+                            ServiceLog("Свойства сокета TCP сервера: " +
+                                           $"Blocking: {client.Blocking}; " +
+                                           $"Connected: {client.Connected}; " +
+                                           $"RemoteEndPoint: {client.RemoteEndPoint}; " +
+                                           $"LocalEndPoint: {client.LocalEndPoint}; ");
+                            ServiceLog("Состояние сокета TCP сервера: " +
+                                       $"handler.Available {client.Available}; " +
+                                       $"SelectRead: {client.Poll(1, SelectMode.SelectRead)}; " +
+                                       $"SelectWrite: {client.Poll(1, SelectMode.SelectWrite)}; " +
+                                       $"SelectError: {client.Poll(1, SelectMode.SelectError)};");
+
                             ServiceLog("Ожидание переподключения");
+                            // accept блокирует дальнейшее выполнение
                             client = socket.Accept();
                         }
+                        
 
                         // если клиент ничего не посылает
                         if (client.Available == 0)
@@ -1114,12 +1263,12 @@ namespace AlinityService
                             if (ServerCount == 100)
                             {
                                 ServerCount = 0;
-                                ServiceLog("Свойства сокета: " +
+                                ServiceLog("Свойства сокета TCP сервера: " +
                                             $"Blocking: {client.Blocking}; " +
                                             $"Connected: {client.Connected}; " +
                                             $"RemoteEndPoint: {client.RemoteEndPoint}; " +
                                             $"LocalEndPoint: {client.LocalEndPoint}; ");
-                                ServiceLog("Состояние сокета: " +
+                                ServiceLog("Состояние сокета TCP сервера: " +
                                            $"handler.Available {client.Available}; " +
                                            $"SelectRead: {client.Poll(1, SelectMode.SelectRead)}; " +
                                            $"SelectWrite: {client.Poll(1, SelectMode.SelectWrite)}; " +
@@ -1141,9 +1290,9 @@ namespace AlinityService
                             // StringBuilder для склеивания полученных данных в одну строку
                             var messageFromAlinity = new StringBuilder();
 
-                            ServiceLog("Свойства сокета: " + $"Blocking: {client.Blocking}; " + $"Connected: {client.Connected}; " + $"RemoteEndPoint: {client.RemoteEndPoint}; ");
+                            ServiceLog("Свойства сокета TCP сервера: " + $"Blocking: {client.Blocking}; " + $"Connected: {client.Connected}; " + $"RemoteEndPoint: {client.RemoteEndPoint}; ");
                             // состояние сокета
-                            ServiceLog("Состояние сокета: " +
+                            ServiceLog("Состояние сокета TCP сервера: " +
                                            $"handler.Available {client.Available}; " +
                                            $"SelectRead: {client.Poll(1, SelectMode.SelectRead)}; " +
                                            $"SelectWrite: {client.Poll(1, SelectMode.SelectWrite)}; " +
@@ -1314,6 +1463,8 @@ namespace AlinityService
                                 // отправка клиентом драйвера
                                 GetRequestFromDB(sending_socket, utf8, MessageId, RID);
 
+                                /*
+                                // если на сокете клиента драйвера есть данные
                                 if (sending_socket.Available > 0)
                                 {
                                     ExchangeLog("Receiving ACK from analyzer SRV");
@@ -1326,6 +1477,7 @@ namespace AlinityService
                                     // выводим данные на консоль
                                     ExchangeLog("Analyzer (driver as CLI):" + "\n" + response);
                                 }
+                                */
                             }
 
                             // если сообщение с результатом - OUL
@@ -1356,6 +1508,13 @@ namespace AlinityService
             ServiceIsActive = true;
             ServiceLog("Сервис начал работу.");
 
+            //TCP клиент для прибора
+            Thread TCPClientThread = new Thread(new ThreadStart(TCPClient));
+            TCPClientThread.Name = "TCPClient";
+            TCPClientThread.Start();
+
+            Thread.Sleep(1000);
+
             //TCP сервер для прибора
             Thread TCPServerThread = new Thread(new ThreadStart(TCPServer));
             TCPServerThread.Name = "TCPServer";
@@ -1365,6 +1524,7 @@ namespace AlinityService
             Thread ResultProcessingThread = new Thread(ResultsProcessing);
             ResultProcessingThread.Name = "ResultsProcessing";
             ResultProcessingThread.Start();
+           
 
         }
 
