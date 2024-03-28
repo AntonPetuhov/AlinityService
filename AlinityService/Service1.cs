@@ -1110,7 +1110,13 @@ namespace AlinityService
 
                     ServiceLog("Shutdown. Close.");
                     sending_socket.Shutdown(SocketShutdown.Both);
-                    sending_socket.Close();
+
+                    // Закрывает подключение к сокету и позволяет повторно его использовать.
+                    // Либо создавать новый объект класса 
+                    //  using a new Socket object before trying a new connection
+                    sending_socket.Disconnect(true);
+                    //sending_socket.Close();
+
                     // пытаемся подключиться
                     ServiceLog("Подключение к серверу анализатора");
                     sending_socket.Connect(receiving_endpoint);
